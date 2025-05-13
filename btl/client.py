@@ -1,281 +1,440 @@
 import socket
 import threading
-import tkinter as tk
-from tkinter import Label
+from tkinter import *
+from tkinter import massagebox
+import urllib.request
+import subprocess
+import sys
 import json
 import os
 import time
 from PIL import Image, ImageTk
 import io
-import zlib # Để giải nén
 
-# --- Cấu hình Client ---
-SERVER_HOST = '192.168.43.163' # SỬA LẠI ĐỊA CHỈ IP CỦA SERVER KHI CHẠY THỰC TẾ
-SERVER_PORT = 65432
-BUFFER_SIZE = 65536 # Tăng buffer cho phù hợp với server
-HOSTNAME = socket.gethostname()
+# --- Cấu hình Giao thức ---
+SERVER_IP = "192.168.1.139" 
+PORT = 12345           
 
 # --- Biến toàn cục ---
-root = None
-display_widget = None # Label để hiển thị stream ảnh
 client_socket = None
-is_connected = False # Client đã kết nối TCP
-is_confirmed = False # Server đã xác nhận
-is_streaming = False # Cờ báo đang nhận stream hay không
-listener_thread = None
-stop_listener_flag = threading.Event() # Cờ để dừng luồng nghe khi thoát
+client_id = "laptop_a" 
+client_name = "Laptop A" 
 
-# --- Hàm gửi tin nhắn JSON tới Server ---
-def send_message_to_server(sock, message_dict):
-    try:
-        message = json.dumps(message_dict).encode('utf-8')
-        message_length = len(message).to_bytes(4, byteorder='big')
-        sock.sendall(message_length + message)
-        # print(f"Đã gửi: {message_dict}")
-        return True
-    except (socket.error, BrokenPipeError, ConnectionResetError) as e:
-        print(f"Lỗi mạng khi gửi tới server: {e}")
-        handle_server_disconnection()
-        return False
-    except Exception as e: print(f"Lỗi gửi không xác định: {e}"); return False
+current_content_frame = None 
+current_image_tk = None 
+reconnect_delay = 5 
 
-# --- Hàm xử lý hiển thị ảnh stream (chạy trên Main Thread) ---
-def update_display_from_stream(image_bytes):
-    global display_widget
-    if not display_widget or not root or not root.winfo_exists():
+# Biến toàn cục để quản lý VLC Player (cho phát nhúng)
+vlc_instance = None
+vlc_player = None
+
+# --- Chức năng GUI ---
+def log_message(message, level="INFO"): 
+    print(f"[{level}] [Client Log] {message}") 
+
+def create_fullscreen_window():
+    global root, display_canvas
+    root = Tk()
+    root.title(f"Màn hình Hiển thị Khách - {client_name}")
+    
+    root.attributes('-fullscreen', True)
+    root.bind("<Escape>", lambda event: root.destroy()) 
+    root.config(bg="black")
+
+    display_canvas = Canvas(root, bg="black", highlightthickness=0)
+    display_canvas.pack(fill=BOTH, expand=YES)
+
+    root.bind("<Configure>", on_resize)
+
+    clear_screen() 
+
+def on_resize(event):
+    # Khi cửa sổ Tkinter thay đổi kích thước, VLC thường tự điều chỉnh.
+    # Không cần code cụ thể ở đây trừ khi bạn muốn kiểm soát chính xác vị trí/kích thước của video.
+    if vlc_player:
+        pass
+
+
+def clear_screen():
+    global current_content_frame, vlc_player
+    if current_content_frame:
+        current_content_frame.destroy()
+        current_content_frame = None
+    display_canvas.delete("all") 
+    display_canvas.config(bg="black") 
+    
+    # Dừng và giải phóng trình phát VLC khi chuyển nội dung hoặc xóa màn hình
+    if vlc_player:
+        log_message("Đang dừng và giải phóng trình phát VLC nhúng.", "INFO")
+        vlc_player.stop()
+        vlc_player.release() # Giải phóng tài nguyên của trình phát hiện tại
+        vlc_player = None
+
+
+def display_text(text_data):
+    clear_screen() 
+    text = text_data.get("text", "")
+    font_size = text_data.get("font_size", 36)
+    font_color = text_data.get("font_color", "#FFFFFF")
+    bg_color = text_data.get("background_color", "#000000")
+
+    display_canvas.config(bg=bg_color)
+    
+    canvas_width = display_canvas.winfo_width()
+    canvas_height = display_canvas.winfo_height()
+    
+    if canvas_width <= 1 or canvas_height <= 1:
+        root.after(100, lambda: display_text(text_data))
         return
 
-    try:
-        # Giải nén zlib
-        decompressed_bytes = zlib.decompress(image_bytes)
-        # Đọc ảnh từ BytesIO
-        img_data = io.BytesIO(decompressed_bytes)
-        img = Image.open(img_data)
+    display_canvas.create_text(
+        canvas_width / 2, canvas_height / 2,
+        text=text,
+        font=("Arial", font_size),
+        fill=font_color,
+        anchor="center",
+        justify="center",
+        width=canvas_width - 20 
+    )
+    log_message("Đã hiển thị văn bản.", "INFO")
 
-        # Resize ảnh để vừa màn hình client (giữ tỷ lệ)
-        window_width = root.winfo_width()
-        window_height = root.winfo_height()
-        img.thumbnail((window_width, window_height), Image.Resampling.LANCZOS)
 
-        photo = ImageTk.PhotoImage(img)
-        display_widget.config(image=photo, text="") # Hiển thị ảnh
-        display_widget.image = photo # Giữ tham chiếu
-    except zlib.error as e:
-         print(f"Lỗi giải nén frame: {e}")
-         # Có thể hiển thị lỗi lên màn hình client
-         display_widget.config(text="Lỗi giải nén frame...", fg="red", image='')
-         display_widget.image=None
-    except Exception as e:
-        print(f"Lỗi hiển thị frame stream: {e}")
-        # Có thể hiển thị lỗi lên màn hình client
-        display_widget.config(text=f"Lỗi hiển thị frame:\n{e}", fg="red", image='')
-        display_widget.image=None
+def display_image(image_data):
+    clear_screen() 
+    image_source_type = image_data.get("type")
+    image_value = image_data.get("value")
+    display_mode = image_data.get("display_mode", "fit")
 
-def clear_display():
-     if display_widget:
-          display_widget.config(text="", image='')
-          display_widget.image = None
-
-# --- Hàm lắng nghe lệnh và dữ liệu từ Server ---
-def listen_to_server(sock):
-    global is_connected, is_confirmed, is_streaming
-    buffer = b""
-    expected_data_len = None # Độ dài của frame ảnh hoặc tin nhắn JSON
-
-    while not stop_listener_flag.is_set():
+    if image_source_type == "url":
         try:
-            data = sock.recv(BUFFER_SIZE)
-            if not data:
-                print("Server đã đóng kết nối.")
-                handle_server_disconnection()
-                break
-
-            buffer += data
-
-            while True: # Xử lý liên tục các tin nhắn/frames trong buffer
-                if expected_data_len is None: # Chưa biết độ dài -> chờ header 4 bytes
-                    if len(buffer) >= 4:
-                        expected_data_len = int.from_bytes(buffer[:4], byteorder='big')
-                        buffer = buffer[4:]
-                        # print(f"Nhận header, chờ data dài: {expected_data_len}")
-                    else:
-                        break # Chưa đủ header
-
-                if expected_data_len is not None and len(buffer) >= expected_data_len:
-                    # Đã đủ dữ liệu cho 1 frame ảnh hoặc 1 tin nhắn JSON
-                    payload = buffer[:expected_data_len]
-                    buffer = buffer[expected_data_len:]
-                    expected_data_len = None # Reset để chờ header tiếp theo
-
-                    # Xử lý payload
-                    if is_streaming:
-                        # Nếu đang stream -> payload là dữ liệu ảnh nén
-                        # print(f"Nhận frame ảnh, size: {len(payload)}")
-                        if root: # Đảm bảo root còn tồn tại
-                            # Lên lịch cập nhật GUI từ main thread
-                            root.after(0, update_display_from_stream, payload)
-                    else:
-                        # Nếu không stream -> payload là tin nhắn JSON
-                        try:
-                            message = json.loads(payload.decode('utf-8'))
-                            print(f"Nhận lệnh JSON: {message}")
-                            msg_type = message.get("type")
-
-                            if msg_type == "confirm":
-                                is_confirmed = True
-                                print("Kết nối đã được Server xác nhận.")
-                                if root: root.after(0, lambda: root.title(f"Client Display - Đã kết nối - {HOSTNAME}"))
-                                if display_widget: root.after(0, lambda: display_widget.config(text="Đã kết nối. Chờ nội dung...", fg="white"))
-
-                            elif msg_type == "stream_start" and is_confirmed:
-                                print("Nhận lệnh bắt đầu stream.")
-                                is_streaming = True
-                                if display_widget: root.after(0, clear_display) # Xóa text chờ
-
-                            elif msg_type == "stream_stop":
-                                print("Nhận lệnh dừng stream.")
-                                is_streaming = False
-                                if display_widget: root.after(0, lambda: display_widget.config(text="Stream đã kết thúc.", fg="white"))
-
-                            # Xử lý các lệnh JSON khác nếu có (ví dụ: display text/image kiểu cũ nếu muốn kết hợp)
-
-                        except json.JSONDecodeError:
-                            print(f"Lỗi: Không thể giải mã JSON khi không ở chế độ stream: {payload[:100]}") # In 100 byte đầu
-                        except Exception as e:
-                            print(f"Lỗi xử lý JSON: {e}")
-                else:
-                     # Chưa đủ dữ liệu cho frame/tin nhắn hiện tại
-                     break # Chờ nhận thêm
-
-        except (ConnectionResetError, BrokenPipeError):
-            print("Mất kết nối tới Server.")
-            handle_server_disconnection()
-            break
-        except socket.timeout:
-             print("Socket recv timeout?") # Không nên xảy ra với blocking socket
-             time.sleep(0.1)
+            log_message(f"Đang tải ảnh từ URL: {image_value}", "INFO")
+            with urllib.request.urlopen(image_value) as url:
+                raw_data = url.read()
+            image = Image.open(io.BytesIO(raw_data))
+            render_image_on_canvas(image, display_mode)
         except Exception as e:
-            # Bắt các lỗi khác như lỗi khi root đã bị hủy
-            if "main window" not in str(e).lower() and "application has been destroyed" not in str(e).lower():
-                 print(f"Lỗi không xác định trong luồng lắng nghe: {e}")
-            handle_server_disconnection()
-            break
+            log_message(f"Lỗi tải ảnh từ URL: {e}", "ERROR")
+            display_canvas.create_text(
+                display_canvas.winfo_width() / 2, display_canvas.winfo_height() / 2,
+                text=f"Không thể tải ảnh: {e}",
+                font=("Arial", 18),
+                fill="red",
+                anchor="center"
+            )
+    else:
+        log_message("Loại nguồn ảnh không xác định hoặc không được hỗ trợ.", "WARNING")
 
-    print("Luồng lắng nghe đã dừng.")
+def render_image_on_canvas(image, display_mode):
+    global current_image_tk
+    canvas_width = display_canvas.winfo_width()
+    canvas_height = display_canvas.winfo_height()
 
-# --- Hàm xử lý khi mất kết nối ---
-def handle_server_disconnection():
-    global is_connected, is_confirmed, is_streaming, client_socket
-    was_connected = is_connected
-    is_connected = False
-    is_confirmed = False
-    is_streaming = False
-    if client_socket:
-        try: client_socket.close()
-        except: pass
-        client_socket = None
+    if canvas_width <= 1 or canvas_height <= 1:
+        root.after(100, lambda: render_image_on_canvas(image, display_mode))
+        return
 
-    if was_connected: # Chỉ hiển thị nếu trước đó đã kết nối
-        print("Đã đóng kết nối client socket.")
-        if root and root.winfo_exists():
-            root.after(0, update_ui_on_disconnect)
+    img_width, img_height = image.size
 
-def update_ui_on_disconnect():
-     if root and root.winfo_exists():
-        root.title(f"Client Display - Đã ngắt kết nối - {HOSTNAME}")
-        if display_widget:
-            display_widget.config(text="Đã mất kết nối tới Server...", fg="red", image='')
-            display_widget.image = None
-        # Tạm thời không tự kết nối lại trong phiên bản stream này
-        # print("Thử kết nối lại sau 5 giây...")
-        # root.after(5000, try_reconnect)
+    if display_mode == "fit":
+        ratio_w = canvas_width / img_width
+        ratio_h = canvas_height / img_height
+        scale_ratio = min(ratio_w, ratio_h)
+        new_width = int(img_width * scale_ratio)
+        new_height = int(img_height * scale_ratio)
+        image = image.resize((new_width, new_height), Image.LANCZOS)
+        x = (canvas_width - new_width) / 2
+        y = (canvas_height - new_height) / 2
+    elif display_mode == "fill":
+        ratio_w = canvas_width / img_width
+        ratio_h = canvas_height / img_height
+        scale_ratio = max(ratio_w, ratio_h)
+        new_width = int(img_width * scale_ratio)
+        new_height = int(img_height * scale_ratio)
+        image = image.resize((new_width, new_height), Image.LANCZOS)
+        x = (canvas_width - new_width) / 2
+        y = (canvas_height - new_height) / 2
+    elif display_mode == "stretch":
+        image = image.resize((canvas_width, canvas_height), Image.LANCZOS)
+        x = 0
+        y = 0
+    else: 
+        ratio_w = canvas_width / img_width
+        ratio_h = canvas_height / img_height
+        scale_ratio = min(ratio_w, ratio_h)
+        new_width = int(img_width * scale_ratio)
+        new_height = int(img_height * scale_ratio)
+        image = image.resize((new_width, new_height), Image.LANCZOS)
+        x = (canvas_width - new_width) / 2
+        y = (canvas_height - new_height) / 2
 
-# --- Hàm kết nối ban đầu ---
+    current_image_tk = ImageTk.PhotoImage(image)
+    log_message("Đã hiển thị ảnh.", "INFO")
+    display_canvas.create_image(x, y, anchor="nw", image=current_image_tk)
+
+def display_video(video_data):
+    global vlc_instance, vlc_player
+    clear_screen() 
+
+    video_source_type = video_data.get("type")
+    video_value = video_data.get("value")
+    loop = video_data.get("loop", False)
+
+    if video_source_type == "url":
+        log_message(f"Đang cố gắng phát video từ URL (nhúng vào cửa sổ Tkinter): {video_value}", "INFO")
+        try:
+            if vlc_instance is None:
+                vlc_instance = vlc.Instance()
+
+            if vlc_player: 
+                vlc_player.stop()
+                vlc_player.release()
+            vlc_player = vlc_instance.media_player_new()
+            
+            window_id = display_canvas.winfo_id()
+
+            if sys.platform.startswith('win'): 
+                vlc_player.set_hwnd(window_id)
+            elif sys.platform.startswith('linux'): 
+                vlc_player.set_xwindow(window_id)
+            elif sys.platform.startswith('darwin'): 
+                log_message("Nhúng video trên macOS rất phức tạp và có thể không hoạt động trực tiếp với Tkinter. Vui lòng thử xem nó có hoạt động không. Nếu không, hãy cân nhắc quay lại phương pháp phát VLC riêng biệt cho macOS.", "WARNING")
+                vlc_player.set_nsobject(window_id) 
+            else:
+                log_message("Hệ điều hành không được hỗ trợ cho phát video nhúng trực tiếp vào cửa sổ Tkinter.", "ERROR")
+                display_canvas.create_text(
+                    display_canvas.winfo_width() / 2, display_canvas.winfo_height() / 2,
+                    text="Hệ điều hành không được hỗ trợ cho phát video nhúng.",
+                    font=("Arial", 18),
+                    fill="red",
+                    anchor="center",
+                    justify="center"
+                )
+                return
+
+            media_options = []
+            if loop:
+                media_options.append(":input-repeat=65535") 
+
+            media = vlc_instance.media_new(video_value, *media_options)
+            vlc_player.set_media(media)
+            vlc_player.play()
+            
+            log_message("Video đang được phát trực tiếp trên màn hình khách (nhúng VLC).", "INFO")
+
+        except Exception as e:
+            log_message(f"Lỗi phát video nhúng: {e}. Đảm bảo VLC và thư viện python-vlc đã được cài đặt và VLC có thể truy cập tệp/URL.", "ERROR")
+            display_canvas.create_text(
+                display_canvas.winfo_width() / 2, display_canvas.winfo_height() / 2,
+                text=f"Lỗi phát video nhúng: {e}\n(VLC hoặc lỗi tệp video)",
+                font=("Arial", 18),
+                fill="red",
+                anchor="center",
+                justify="center"
+            )
+    else:
+        log_message("Loại nguồn video không xác định hoặc không được hỗ trợ cho phát nhúng.", "WARNING")
+
+# --- HÀM MỚI ĐỂ ĐIỀU KHIỂN VIDEO ---
+def handle_video_play():
+    global vlc_player
+    if vlc_player:
+        log_message("Đang tiếp tục phát video.", "INFO")
+        vlc_player.play()
+    else:
+        log_message("Không có video nào đang phát để tiếp tục.", "WARNING")
+
+def handle_video_pause():
+    global vlc_player
+    if vlc_player and vlc_player.is_playing():
+        log_message("Đang tạm dừng phát video.", "INFO")
+        vlc_player.pause()
+    else:
+        log_message("Không có video nào đang phát để tạm dừng.", "WARNING")
+
+def handle_video_stop():
+    global vlc_player
+    if vlc_player:
+        log_message("Đang dừng phát video và xóa màn hình.", "INFO")
+        vlc_player.stop()
+        clear_screen() # Dừng video và xóa màn hình client
+    else:
+        log_message("Không có video nào đang phát để dừng.", "WARNING")
+
+def handle_video_seek(time_ms):
+    global vlc_player
+    if vlc_player and vlc_player.is_playing():
+        log_message(f"Đang tua video đến {time_ms}ms.", "INFO")
+        vlc_player.set_time(time_ms)
+    else:
+        log_message("Không có video nào đang phát để tua.", "WARNING")
+
+def handle_video_volume(volume):
+    global vlc_player
+    if vlc_player:
+        log_message(f"Đang đặt âm lượng video thành {volume}.", "INFO")
+        vlc_player.audio_set_volume(volume)
+    else:
+        log_message("Không có video nào đang phát để điều chỉnh âm lượng.", "WARNING")
+
+
+# --- Logic Giao tiếp Máy khách ---
 def connect_to_server():
-    global client_socket, is_connected, is_confirmed, is_streaming, listener_thread
-    if is_connected: return True # Đã kết nối rồi
-
+    global client_socket
+    if client_socket:
+        try:
+            client_socket.close()
+        except:
+            pass 
+    client_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     try:
-        is_confirmed = False
-        is_streaming = False
-        sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        # sock.settimeout(10.0) # Đặt timeout cho connect
-        sock.connect((SERVER_HOST, SERVER_PORT))
-        # sock.settimeout(None) # Bỏ timeout sau khi kết nối
-        print(f"Đã kết nối TCP tới Server {SERVER_HOST}:{SERVER_PORT}")
-        client_socket = sock
-        is_connected = True
+        log_message(f"Đang kết nối tới máy chủ tại {SERVER_IP}:{PORT}...", "INFO")
+        client_socket.connect((SERVER_IP, PORT))
+        log_message(f"Đã kết nối tới máy chủ tại {SERVER_IP}:{PORT}", "INFO")
+        
+        registration_msg = {
+            "command": "CLIENT_REGISTER",
+            "client_id": client_id,
+            "client_name": client_name
+        }
+        client_socket.sendall(json.dumps(registration_msg).encode('utf-8') + b'\n')
+        ack = client_socket.recv(4096).decode('utf-8') 
+        ack_data = json.loads(ack.strip()) 
+        if ack_data.get("status") == "SUCCESS":
+            log_message("Đã đăng ký thành công với máy chủ.", "INFO")
+            listen_thread = threading.Thread(target=listen_for_commands)
+            listen_thread.daemon = True 
+            listen_thread.start()
+        else:
+            log_message(f"Đăng ký máy chủ thất bại: {ack_data.get('message')}", "ERROR")
+            messagebox.showerror("Lỗi kết nối", f"Đăng ký máy chủ thất bại: {ack_data.get('message')}")
+            sys.exit(1) 
 
-        connect_msg = {"type": "connect", "hostname": HOSTNAME}
-        if not send_message_to_server(sock, connect_msg):
-             handle_server_disconnection()
-             return False
-
-        # Khởi động luồng lắng nghe nếu chưa có hoặc đã dừng
-        stop_listener_flag.clear() # Đảm bảo cờ dừng không bị set
-        listener_thread = threading.Thread(target=listen_to_server, args=(sock,), daemon=True)
-        listener_thread.start()
-        return True
-
-    except socket.timeout:
-        print(f"Không thể kết nối tới server (timeout).")
-        handle_server_disconnection()
-        return False
-    except socket.error as e:
-        print(f"Không thể kết nối tới server {SERVER_HOST}:{SERVER_PORT} - {e}")
-        handle_server_disconnection()
-        return False
+    except ConnectionRefusedError:
+        log_message(f"Kết nối bị từ chối. Máy chủ đang chạy tại {SERVER_IP}:{PORT} không?", "ERROR")
+        root.after(reconnect_delay * 1000, connect_to_server) 
     except Exception as e:
-        print(f"Lỗi không xác định khi kết nối: {e}")
-        handle_server_disconnection()
-        return False
+        log_message(f"Lỗi khi kết nối tới máy chủ: {e}", "ERROR")
+        root.after(reconnect_delay * 1000, connect_to_server) 
 
-# --- Hàm tạo GUI ---
-def create_gui():
-    global root, display_widget
+def listen_for_commands():
+    global client_socket
+    buffer = ""
+    while True:
+        try:
+            data = client_socket.recv(4096).decode('utf-8')
+            if not data:
+                log_message("Máy chủ đã ngắt kết nối.", "WARNING")
+                break 
+            
+            buffer += data
+            while "\n" in buffer: 
+                message, _, buffer = buffer.partition('\n')
+                if not message.strip(): 
+                    continue
+                try:
+                    command = json.loads(message)
+                    process_command(command)
+                    send_acknowledgement(command, "SUCCESS")
+                except json.JSONDecodeError:
+                    log_message(f"JSON không hợp lệ nhận được: {message}", "ERROR")
+                    send_acknowledgement({"command": "UNKNOWN", "original_command_id": "N/A"}, "FAILURE", "JSON không hợp lệ")
+                except Exception as e:
+                    log_message(f"Lỗi xử lý lệnh: {e}, Lệnh: {message}", "ERROR")
+                    send_acknowledgement(command, "FAILURE", str(e))
 
-    root = tk.Tk()
-    root.title(f"Client Display - Đang kết nối - {HOSTNAME}")
-    root.configure(bg="black") # Nền đen cho toàn bộ cửa sổ
+        except socket.error as e:
+            log_message(f"Lỗi socket: {e}. Đang cố gắng kết nối lại...", "ERROR")
+            break 
+        except Exception as e:
+            log_message(f"Một lỗi không mong muốn đã xảy ra: {e}", "ERROR")
+            break 
+    
+    log_message("Luồng lắng nghe đã kết thúc. Đang cố gắng kết nối lại...", "INFO")
+    reconnect_to_server()
 
-    display_widget = Label(root, text="Đang kết nối tới Server...", font=("Arial", 24),
-                           fg="white", bg="black", justify="center")
-    display_widget.pack(fill=tk.BOTH, expand=True)
+def process_command(command):
+    cmd_type = command.get("command")
+    content_data = command.get("content")
 
-    root.attributes('-fullscreen', True)
-    root.bind('<Escape>', lambda e: exit_fullscreen()) # Thoát fullscreen và đóng app
+    log_message(f"Đã nhận lệnh: {cmd_type}", "INFO")
 
-    if not connect_to_server():
-        if display_widget: display_widget.config(text=f"Không thể kết nối tới Server\n{SERVER_HOST}:{SERVER_PORT}", fg="red")
-        # Tạm thời không tự kết nối lại
-        # print("Sẽ thử lại sau 5 giây...")
-        # root.after(5000, try_reconnect)
+    if cmd_type == "DISPLAY_TEXT":
+        root.after(0, lambda: display_text(content_data))
+    elif cmd_type == "DISPLAY_IMAGE":
+        root.after(0, lambda: display_image(content_data))
+    elif cmd_type == "DISPLAY_VIDEO":
+        root.after(0, lambda: display_video(content_data)) 
+    elif cmd_type == "CLEAR_SCREEN":
+        root.after(0, clear_screen)
+    # --- XỬ LÝ LỆNH ĐIỀU KHIỂN VIDEO MỚI ---
+    elif cmd_type == "VIDEO_PLAY":
+        root.after(0, handle_video_play)
+    elif cmd_type == "VIDEO_PAUSE":
+        root.after(0, handle_video_pause)
+    elif cmd_type == "VIDEO_STOP":
+        root.after(0, handle_video_stop)
+    elif cmd_type == "VIDEO_SEEK":
+        time_ms = content_data.get("time_ms")
+        root.after(0, lambda: handle_video_seek(time_ms))
+    elif cmd_type == "VIDEO_VOLUME":
+        volume_val = content_data.get("volume")
+        root.after(0, lambda: handle_video_volume(volume_val))
+    # --- HẾT XỬ LÝ LỆNH MỚI ---
+    elif cmd_type == "ACKNOWLEDGEMENT":
+        log_message(f"Nhận được ACK từ Server cho lệnh {command.get('original_command_id')}: {command.get('status')} - {command.get('message')}", "INFO")
+    else:
+        log_message(f"Lệnh không xác định: {cmd_type}", "WARNING")
 
-    def on_closing_client():
-        print("Đóng ứng dụng Client...")
-        stop_listener_flag.set() # Báo cho luồng nghe dừng lại
-        handle_server_disconnection() # Đóng socket
-        if listener_thread and listener_thread.is_alive():
-             print("Đang chờ luồng lắng nghe kết thúc...")
-             listener_thread.join(timeout=1.0) # Chờ tối đa 1s
-        root.destroy()
+def send_acknowledgement(original_command, status, message=""):
+    ack = {
+        "command": "ACKNOWLEDGEMENT",
+        "original_command_id": original_command.get("command", "N/A"), 
+        "status": status,
+        "message": message
+    }
+    try:
+        client_socket.sendall(json.dumps(ack).encode('utf-8') + b'\n')
+    except Exception as e:
+        log_message(f"Lỗi gửi ACK: {e}", "ERROR")
 
-    def exit_fullscreen(event=None):
-         print("Thoát fullscreen và đóng ứng dụng...")
-         root.attributes('-fullscreen', False)
-         # Đợi một chút rồi đóng để tránh lỗi đồ họa
-         root.after(100, on_closing_client)
+def reconnect_to_server():
+    global client_socket
+    if client_socket:
+        try:
+            client_socket.close()
+        except:
+            pass
+    log_message(f"Đang cố gắng kết nối lại sau {reconnect_delay} giây...", "INFO")
+    root.after(reconnect_delay * 1000, connect_to_server)
 
 
-    root.protocol("WM_DELETE_WINDOW", on_closing_client) # Xử lý khi nhấn nút X (nếu không fullscreen)
+# --- Thực thi Chính ---
+if __name__ == "__main__":
+    if len(sys.argv) > 1:
+        client_id = sys.argv[1]
+        client_name = client_id 
+    if len(sys.argv) > 2:
+        SERVER_IP = sys.argv[2] 
 
     try:
-        root.mainloop()
-    except KeyboardInterrupt:
-        print("Ctrl+C detected, closing client...")
-        on_closing_client()
+        subprocess.run(
+            ["vlc", "--version"], 
+            capture_output=True, 
+            check=True, 
+            creationflags=subprocess.CREATE_NO_WINDOW, 
+            stdin=subprocess.DEVNULL
+        )
+        log_message("Đã tìm thấy VLC. Sẽ sử dụng nó để phát video nhúng.", "INFO")
+    except (subprocess.CalledProcessError, FileNotFoundError):
+        log_message("Không tìm thấy VLC. Phát video nhúng sẽ không hoạt động. Vui lòng cài đặt VLC và đảm bảo nó có trong PATH của hệ thống.", "ERROR")
+        sys.exit(1) 
 
-# --- Chạy chương trình ---
-if __name__ == "__main__":
-    create_gui()
-    print("Ứng dụng Client Stream đã thoát.")
+    create_fullscreen_window() 
+    threading.Thread(target=connect_to_server, daemon=True).start() 
+    root.mainloop()
+
+    if vlc_player:
+        vlc_player.stop()
+        vlc_player.release()
+    if vlc_instance:
+        vlc_instance.release()
